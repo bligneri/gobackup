@@ -114,16 +114,24 @@ type SubConfig struct {
 func Init(configFile string) error {
 	logger := logger.Tag("Config")
 
-	viper.SetConfigType("yaml")
-
+	// Log the raw environment variable directly from the OS
+	envVar := os.Getenv("MODELS_RDS_DATABASES_DOCKER_DB_DATABASE")
+	logger.Info("Raw env var MODELS_RDS_DATABASES_DOCKER_DB_DATABASE:", envVar)
 	// set config file directly
 	if len(configFile) > 0 {
 		configFile = helper.AbsolutePath(configFile)
 		logger.Info("Load config:", configFile)
 
 		viper.SetConfigFile(configFile)
+		viper.AutomaticEnv()
+		viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+		viper.BindEnv("models.rds.databases.docker_db.database", "MODELS_RDS_DATABASES_DOCKER_DB_DATABASE")
+		logger.Info("Database from env1: ", viper.GetString("models.rds.databases.docker_db.database"))
+
 	} else {
-		logger.Info("Load config from default path.")
+		logger.Info("Load config from env variables for db username, database, password path.")
+		viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+		viper.AutomaticEnv()
 		viper.SetConfigName("gobackup")
 
 		// ./gobackup.yml
@@ -132,6 +140,10 @@ func Init(configFile string) error {
 		viper.AddConfigPath("$HOME/.gobackup") // call multiple times to add many search paths
 		// /etc/gobackup/gobackup.yml
 		viper.AddConfigPath("/etc/gobackup/") // path to look for the config file in
+
+		// Log the current Viper settings to see the loaded config
+		logger.Info("Loaded Viper settings: ", viper.AllSettings()) // Logs all settings
+
 	}
 
 	viper.WatchConfig()
@@ -164,6 +176,36 @@ func loadConfig() error {
 
 	logger := logger.Tag("Config")
 
+	// Set up Viper to prioritize environment variables
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	viper.AutomaticEnv()
+
+	// Support for keys provided in  the environment
+	// A key in database1: password would have to be called DATABASE1_PASSWORD
+	// The yaml value has to be empty for instance
+	// database1:
+	//    password:
+	//
+	// Real life example:
+	// models:
+	//   rds:
+	//     databases:
+	//       docker_db:
+	//         type: postgresql
+	//         database:
+	//         username:
+	//         password:
+	// => Three env variables are to be instantiated:
+	// MODELS_RDS_DATABASES_DOCKER_DB_DATABASE="database_name"
+	// MODELS_RDS_DATABASES_DOCKER_DB_USERNAME="postgres
+	// MODELS_RDS_DATABASES_DOCKER_DB_PASSWORD="password"
+	// has to be set
+	//
+	// Rules:
+	// - all UPPERCASE
+	// - replace `:` with _
+	// - make sure to include the complete hierarchy (start from /)
+
 	err := viper.ReadInConfig()
 	if err != nil {
 		logger.Error("Load gobackup config failed: ", err)
@@ -171,14 +213,13 @@ func loadConfig() error {
 	}
 
 	viperConfigFile := viper.ConfigFileUsed()
+	logger.Info("Config file:", viperConfigFile)
 	if info, err := os.Stat(viperConfigFile); err == nil {
 		// max permission: 0770
 		if info.Mode()&(1<<2) != 0 {
 			logger.Warnf("Other users are able to access %s with mode %v", viperConfigFile, info.Mode())
 		}
 	}
-
-	logger.Info("Config file:", viperConfigFile)
 
 	// load .env if exists in the same directory of used config file and expand variables in the config
 	dotEnv := filepath.Join(filepath.Dir(viperConfigFile), ".env")
@@ -189,7 +230,12 @@ func loadConfig() error {
 		}
 	}
 
-	cfg, _ := os.ReadFile(viperConfigFile)
+	cfg, err := os.ReadFile(viperConfigFile)
+	if err != nil {
+		logger.Errorf("Error reading config file: %v", err)
+		return err
+	}
+
 	if err := viper.ReadConfig(strings.NewReader(os.ExpandEnv(string(cfg)))); err != nil {
 		logger.Errorf("Load expanded config failed: %v", err)
 		return err
@@ -297,16 +343,53 @@ func loadScheduleConfig(model *ModelConfig) {
 }
 
 func loadDatabasesConfig(model *ModelConfig) {
-	subViper := model.Viper.Sub("databases")
-	model.Databases = map[string]SubConfig{}
-	for key := range model.Viper.GetStringMap("databases") {
-		dbViper := subViper.Sub(key)
-		model.Databases[key] = SubConfig{
-			Name:  key,
-			Type:  dbViper.GetString("type"),
-			Viper: dbViper,
+	model.Databases = make(map[string]SubConfig)
+
+	// Get the databases map from the model's Viper instance
+	for dbKey := range model.Viper.GetStringMap("databases") {
+		dbPath := fmt.Sprintf("models.%s.databases.%s", model.Name, dbKey)
+
+		// Log the DB info content for debugging
+		logger.Debug("Database config for", dbKey, ":", viper.GetString(fmt.Sprintf("%s.database", dbPath)))
+
+		// Populate the database config
+		model.Databases[dbKey] = SubConfig{
+			Name:  dbKey,
+			Type:  viper.GetString(fmt.Sprintf("%s.type", dbPath)),     // Use full path for 'type'
+			Viper: model.Viper.Sub(fmt.Sprintf("databases.%s", dbKey)), // Keep the sub-viper for consistency
 		}
+
+		// Directly set the database fields using the full path
+		// => We need to to this because Viper.Sub does not inherit the environment variable properly
+		// It creates a new instance with no env variable available to overwrtite the otherwise empty values
+		model.Databases[dbKey].Viper.Set("database", viper.GetString(fmt.Sprintf("%s.database", dbPath)))
+		model.Databases[dbKey].Viper.Set("username", viper.GetString(fmt.Sprintf("%s.username", dbPath)))
+		model.Databases[dbKey].Viper.Set("password", viper.GetString(fmt.Sprintf("%s.password", dbPath)))
+
+		// Log the final database configuration for debugging
+		logger.Debug("Database:", model.Databases[dbKey].Viper.GetString("database"))
+		logger.Debug("Username:", model.Databases[dbKey].Viper.GetString("username"))
+
+		logger.Info("Database config for", dbKey, ":", viper.GetString(fmt.Sprintf("%s.database", dbPath)))
+
 	}
+
+	if len(model.Databases) == 0 {
+		logger.Error("No databases found for model:", model.Name)
+	}
+	// subViper := model.Viper.Sub("databases")
+	// model.Databases = map[string]SubConfig{}
+	// for key := range model.Viper.GetStringMap("databases") {
+	// 	logger.Info("SubViper for database:", key)
+	// 	logger.Info("Content:", model.Viper.AllSettings())
+
+	// 	dbViper := subViper.Sub(key)
+	// 	model.Databases[key] = SubConfig{
+	// 		Name:  key,
+	// 		Type:  dbViper.GetString("type"),
+	// 		Viper: dbViper,
+	// 	}
+	// }
 }
 
 func loadStoragesConfig(model *ModelConfig) {
